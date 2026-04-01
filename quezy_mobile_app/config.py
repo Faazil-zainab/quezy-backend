@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta
 
-BASE_URL = os.getenv("QUEZY_API_BASE_URL", "https://your-backend-domain.onrender.com").rstrip("/")
+BASE_URL = os.getenv("QUEZY_API_BASE_URL", "https://quezy-backend.onrender.com").rstrip("/")
 QUEUE_REFRESH_SECONDS = 30
 UPI_LINK = "upi://pay?pa=faazil3468@oksbi"
 
