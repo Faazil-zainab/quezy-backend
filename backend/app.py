@@ -14,7 +14,6 @@ from clinic_profiles import DOCTOR_PROFILES, get_doctor_profile
 from waiting_time_ml import (
     DATASET_PATH,
     MODEL_PATH,
-    apply_dynamic_rescheduling,
     build_and_train_pipeline,
     predict_waiting_time,
 )
@@ -26,6 +25,7 @@ DATA_DIR = Path(os.getenv("QUEZY_DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 USERS_FILE = DATA_DIR / "users.xlsx"
 BOOKINGS_FILE = DATA_DIR / "appointments_bookings.csv"
+CANCELLED_BOOKINGS_FILE = DATA_DIR / "cancelled_bookings.csv"
 EXPECTED_COLUMNS = ["FullName", "Email", "Phone", "Password"]
 BOOKING_COLUMNS = [
     "booking_id",
@@ -43,6 +43,7 @@ BOOKING_COLUMNS = [
     "appointment_hour",
     "day_of_week",
     "priority_booking",
+    "priority_flag",
     "queue_position",
     "patients_ahead",
     "avg_consultation_time",
@@ -55,6 +56,25 @@ BOOKING_COLUMNS = [
     "coupon_discount",
     "total_amount",
     "created_at",
+    "priority_status",
+]
+
+CANCELLED_BOOKING_COLUMNS = [
+    "booking_id",
+    "patient_name",
+    "phone_number",
+    "email",
+    "medical_problem",
+    "clinic_name",
+    "doctor_name",
+    "queue_position",
+    "time_slot",
+    "appointment_date",
+    "priority_booking",
+    "cancel_reason",
+    "cancel_comments",
+    "cancel_time",
+    "cancellation_reason_code",
 ]
 
 EMAIL_REGEX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -66,6 +86,9 @@ ML_STATUS: Dict[str, Any] = {
     "dataset_path": str(DATASET_PATH),
     "model_path": str(MODEL_PATH),
 }
+MIN_WAITING_MINUTES = 15
+MAX_APPOINTMENTS_PER_SLOT = 2
+PRIORITY_NORMAL_THRESHOLD = 5
 
 
 def ensure_ml_assets() -> None:
@@ -129,6 +152,11 @@ def ensure_users_file() -> None:
 def ensure_bookings_file() -> None:
     if not BOOKINGS_FILE.exists():
         pd.DataFrame(columns=BOOKING_COLUMNS).to_csv(BOOKINGS_FILE, index=False)
+
+
+def ensure_cancelled_bookings_file() -> None:
+    if not CANCELLED_BOOKINGS_FILE.exists():
+        pd.DataFrame(columns=CANCELLED_BOOKING_COLUMNS).to_csv(CANCELLED_BOOKINGS_FILE, index=False)
 
 
 def load_users_df() -> pd.DataFrame:
@@ -221,8 +249,178 @@ def format_clock(value: datetime) -> str:
     return value.strftime("%I:%M %p")
 
 
+def expected_consultation_from_slot(appointment_date: str, time_slot: str, wait_minutes: int) -> str:
+    appointment_date_value = parse_appointment_date(appointment_date)
+    appointment_time_value = parse_time_slot(time_slot)
+    appointment_timestamp = appointment_date_value.replace(
+        hour=appointment_time_value.hour,
+        minute=appointment_time_value.minute,
+        second=0,
+        microsecond=0,
+    )
+    return format_clock(appointment_timestamp + timedelta(minutes=int(wait_minutes)))
+
+
+def normalize_wait_minutes(patients_ahead: int, raw_wait_minutes: int) -> int:
+    if int(patients_ahead) <= 0:
+        return 0
+    return max(int(raw_wait_minutes), MIN_WAITING_MINUTES)
+
+
+def parse_bool(value: Any) -> bool:
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "priority"}
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def priority_status_from_flag(priority_flag: bool) -> str:
+    return "PRIORITY" if priority_flag else "NORMAL"
+
+
+def get_normal_booking_counter(bookings_df: pd.DataFrame) -> int:
+    if bookings_df.empty:
+        return 0
+
+    ordered = bookings_df.copy()
+    ordered["created_at_dt"] = pd.to_datetime(ordered["created_at"], errors="coerce")
+    ordered = ordered.sort_values(by=["created_at_dt", "created_at"], ascending=[True, True], na_position="last")
+    ordered = ordered.reset_index(drop=True)
+
+    priority_series = ordered["priority_booking"].apply(parse_bool)
+    priority_indices = ordered.index[priority_series].tolist()
+
+    if not priority_indices:
+        return int((~priority_series).sum())
+
+    last_priority_idx = priority_indices[-1]
+    trailing = ordered.iloc[last_priority_idx + 1 :]
+    if trailing.empty:
+        return 0
+
+    return int((~trailing["priority_booking"].apply(parse_bool)).sum())
+
+
+def recalculate_group_queue(
+    group_df: pd.DataFrame,
+    additional_delay_minutes: int = 0,
+    apply_delay_below_priority_only: bool = False,
+) -> pd.DataFrame:
+    if group_df.empty:
+        return group_df
+
+    ordered = group_df.copy()
+    ordered["queue_position_num"] = ordered["queue_position"].apply(lambda x: parse_int(x, default=999999))
+    ordered["created_at_dt"] = pd.to_datetime(ordered["created_at"], errors="coerce")
+    ordered = ordered.sort_values(
+        by=["queue_position_num", "created_at_dt", "created_at"],
+        ascending=[True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    ordered["queue_position"] = range(1, len(ordered) + 1)
+    ordered["patients_ahead"] = ordered["queue_position"] - 1
+
+    avg_consult = ordered["avg_consultation_time"].apply(lambda x: max(parse_int(x, default=10), 1))
+    base_wait = ordered["patients_ahead"] * avg_consult
+
+    delay_mask = pd.Series([True] * len(ordered), index=ordered.index)
+    if apply_delay_below_priority_only:
+        priority_mask = ordered["priority_booking"].apply(parse_bool)
+        if priority_mask.any():
+            insertion_point = int(ordered.loc[priority_mask, "queue_position"].min())
+            delay_mask = ordered["queue_position"] >= insertion_point
+
+    waits = base_wait.copy()
+    if additional_delay_minutes > 0:
+        waits = waits + (delay_mask.astype(int) * additional_delay_minutes)
+
+    ordered["predicted_waiting_time"] = ordered.apply(
+        lambda row: normalize_wait_minutes(
+            parse_int(row.get("patients_ahead", 0), 0),
+            parse_int(waits.iloc[row.name], 0),
+        ),
+        axis=1,
+    )
+    ordered["expected_consultation_time"] = ordered.apply(
+        lambda row: expected_consultation_from_slot(
+            str(row.get("appointment_date", "")).strip(),
+            str(row.get("time_slot", "")).strip(),
+            parse_int(row.get("predicted_waiting_time", MIN_WAITING_MINUTES), MIN_WAITING_MINUTES),
+        ),
+        axis=1,
+    )
+    ordered["priority_status"] = ordered["priority_booking"].apply(
+        lambda flag: priority_status_from_flag(parse_bool(flag))
+    )
+
+    return ordered.drop(columns=["queue_position_num", "created_at_dt"])
+
+
+def recalculate_and_save_filtered_queues(
+    full_df: pd.DataFrame,
+    clinic_name: str = "",
+    doctor_name: str = "",
+    appointment_date: str = "",
+    additional_delay_minutes: int = 0,
+    apply_delay_below_priority_only: bool = False,
+) -> pd.DataFrame:
+    if full_df.empty:
+        return full_df
+
+    updated_df = full_df.copy()
+    mask = pd.Series([True] * len(updated_df), index=updated_df.index)
+
+    if clinic_name:
+        mask = mask & updated_df["clinic_name"].astype(str).eq(clinic_name)
+    if doctor_name:
+        mask = mask & updated_df["doctor_name"].astype(str).eq(doctor_name)
+    if appointment_date:
+        mask = mask & updated_df["appointment_date"].astype(str).eq(appointment_date)
+
+    subset = updated_df[mask].copy()
+    if subset.empty:
+        return updated_df
+
+    grouped = subset.groupby(["clinic_id", "doctor_id", "appointment_date", "time_slot"], dropna=False)
+
+    for _, group in grouped:
+        recalculated = recalculate_group_queue(
+            group,
+            additional_delay_minutes=additional_delay_minutes,
+            apply_delay_below_priority_only=apply_delay_below_priority_only,
+        )
+        for _, row in recalculated.iterrows():
+            booking_id = str(row.get("booking_id", "")).strip()
+            if not booking_id:
+                continue
+            booking_mask = updated_df["booking_id"].astype(str).eq(booking_id)
+            if not booking_mask.any():
+                continue
+            for column in [
+                "queue_position",
+                "patients_ahead",
+                "predicted_waiting_time",
+                "expected_consultation_time",
+                "priority_status",
+            ]:
+                updated_df.loc[booking_mask, column] = row[column]
+
+    return updated_df
+
+
 def booking_row_to_summary(record: pd.Series) -> Dict[str, Any]:
-    priority_booking = bool(int(float(record["priority_booking"] or 0)))
+    priority_booking = parse_bool(record["priority_booking"])
+    patients_ahead = int(float(record["patients_ahead"] or 0))
+    predicted_wait = normalize_wait_minutes(
+        patients_ahead,
+        int(round(float(record["predicted_waiting_time"] or 0))),
+    )
     return {
         "bookingId": str(record["booking_id"]),
         "name": str(record["patient_name"]),
@@ -238,10 +436,12 @@ def booking_row_to_summary(record: pd.Series) -> Dict[str, Any]:
         "timeSlot": str(record["time_slot"]),
         "arrivalTime": str(record["arrival_time"]),
         "queuePosition": int(float(record["queue_position"] or 0)),
-        "patientsAhead": int(float(record["patients_ahead"] or 0)),
-        "predictedWait": int(round(float(record["predicted_waiting_time"] or 0))),
+        "patientsAhead": patients_ahead,
+        "predictedWait": predicted_wait,
         "expectedConsultation": str(record["expected_consultation_time"]),
         "priorityBooking": priority_booking,
+        "priorityFlag": priority_booking,
+        "priorityStatus": str(record.get("priority_status", priority_status_from_flag(priority_booking))),
         "paymentMethod": str(record["payment_method"]),
         "couponCode": str(record["coupon_code"]),
         "couponDiscount": int(float(record["coupon_discount"] or 0)),
@@ -256,7 +456,8 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
     appointment_date = str(data.get("appointment_date", "")).strip()
     time_slot = str(data.get("time_slot", "")).strip()
     medical_problem = str(data.get("medical_problem", "")).strip()
-    priority_booking = 1 if bool(data.get("priority_booking", False)) else 0
+    priority_requested = bool(data.get("priority_booking", False))
+    priority_booking = 1 if priority_requested else 0
     requested_booking_id = str(data.get("booking_id", "")).strip()
 
     doctor_profile = get_doctor_profile(doctor_name, clinic_name)
@@ -271,6 +472,9 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
         second=0,
         microsecond=0,
     )
+
+    if appointment_time_value.minute not in (0, 30) or not (10 <= appointment_time_value.hour <= 22):
+        raise ValueError("Clinic booking time must be between 10:00 AM and 10:00 PM in 30-minute slots")
 
     bookings_df = load_bookings_df()
 
@@ -299,25 +503,32 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
         & bookings_df["time_slot"].astype(str).eq(time_slot)
     ]
 
-    queue_position = len(same_slot_bookings.index) + 1
+    if len(same_slot_bookings.index) >= MAX_APPOINTMENTS_PER_SLOT:
+        raise ValueError("slots are already booked on this time no more booking")
+
+    normal_booking_counter = get_normal_booking_counter(bookings_df)
+    if priority_requested and normal_booking_counter < PRIORITY_NORMAL_THRESHOLD:
+        raise ValueError(
+            f"Priority booking is allowed only after {PRIORITY_NORMAL_THRESHOLD} normal bookings. "
+            f"Current normal booking counter: {normal_booking_counter}"
+        )
+
+    base_queue_position = len(same_slot_bookings.index) + 1
+    queue_position = base_queue_position
+    if priority_requested and base_queue_position > 1:
+        # Controlled priority shift: move only one slot ahead.
+        queue_position = base_queue_position - 1
+
     patients_ahead = max(queue_position - 1, 0)
     day_of_week = appointment_date_value.isoweekday()
     appointment_hour = appointment_timestamp.hour
     avg_consultation_time = int(doctor_profile["avg_consultation_time"])
 
-    ml_prediction = predict_waiting_time(
-        queue_position=queue_position,
-        patients_ahead=patients_ahead,
-        appointment_hour=appointment_hour,
-        priority_booking=priority_booking,
-        doctor_id=int(doctor_profile["doctor_id"]),
-        clinic_id=int(doctor_profile["clinic_id"]),
-        day_of_week=day_of_week,
+    predicted_waiting_time = normalize_wait_minutes(
+        patients_ahead,
+        patients_ahead * avg_consultation_time,
     )
-    formula_wait = max((patients_ahead * avg_consultation_time) - (5 if priority_booking else 0), 0)
-    predicted_waiting_time = max(round((float(ml_prediction["predicted_waiting_time"]) + formula_wait) / 2), 0)
-
-    expected_consultation_time = format_clock(appointment_timestamp + timedelta(minutes=predicted_waiting_time))
+    expected_consultation_time = expected_consultation_from_slot(appointment_date, time_slot, predicted_waiting_time)
     arrival_time = format_clock(appointment_timestamp - timedelta(minutes=5))
     booking_id = requested_booking_id or generate_booking_id()
 
@@ -340,6 +551,8 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
         "predictedWait": predicted_waiting_time,
         "expectedConsultation": expected_consultation_time,
         "priorityBooking": bool(priority_booking),
+        "priorityStatus": priority_status_from_flag(bool(priority_booking)),
+        "normalBookingCounter": 0 if priority_requested else (normal_booking_counter + (1 if persist else 0)),
         "paymentMethod": str(data.get("payment_method", "Not Selected")).strip() or "Not Selected",
         "couponCode": str(data.get("coupon_code", "None")).strip() or "None",
         "couponDiscount": int(float(data.get("coupon_discount", 0) or 0)),
@@ -348,6 +561,45 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
     }
 
     if persist:
+        if priority_requested and base_queue_position > 1:
+            existing_same_slot = bookings_df[
+                bookings_df["doctor_id"].astype(str).eq(str(doctor_profile["doctor_id"]))
+                & bookings_df["clinic_id"].astype(str).eq(str(doctor_profile["clinic_id"]))
+                & bookings_df["appointment_date"].astype(str).eq(appointment_date)
+                & bookings_df["time_slot"].astype(str).eq(time_slot)
+            ].copy()
+            if not existing_same_slot.empty:
+                existing_same_slot["queue_position_num"] = existing_same_slot["queue_position"].apply(
+                    lambda x: parse_int(x, default=999999)
+                )
+                existing_same_slot["created_at_dt"] = pd.to_datetime(existing_same_slot["created_at"], errors="coerce")
+                existing_same_slot = existing_same_slot.sort_values(
+                    by=["queue_position_num", "created_at_dt", "created_at"],
+                    ascending=[True, True, True],
+                    na_position="last",
+                )
+
+                shift_candidate = existing_same_slot[
+                    existing_same_slot["queue_position_num"].eq(queue_position)
+                ]
+                if not shift_candidate.empty:
+                    row = shift_candidate.iloc[0]
+                    candidate_booking_id = str(row["booking_id"])
+                    candidate_mask = bookings_df["booking_id"].astype(str).eq(candidate_booking_id)
+                    shifted_position = queue_position + 1
+                    shifted_ahead = max(shifted_position - 1, 0)
+                    shifted_avg = max(parse_int(row.get("avg_consultation_time", avg_consultation_time), avg_consultation_time), 1)
+                    shifted_wait = normalize_wait_minutes(shifted_ahead, shifted_ahead * shifted_avg)
+
+                    bookings_df.loc[candidate_mask, "queue_position"] = shifted_position
+                    bookings_df.loc[candidate_mask, "patients_ahead"] = shifted_ahead
+                    bookings_df.loc[candidate_mask, "predicted_waiting_time"] = shifted_wait
+                    bookings_df.loc[candidate_mask, "expected_consultation_time"] = expected_consultation_from_slot(
+                        str(row.get("appointment_date", appointment_date)).strip(),
+                        str(row.get("time_slot", time_slot)).strip(),
+                        shifted_wait,
+                    )
+
         new_row = {
             "booking_id": booking_id,
             "patient_name": summary["name"],
@@ -364,6 +616,7 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
             "appointment_hour": appointment_hour,
             "day_of_week": day_of_week,
             "priority_booking": priority_booking,
+            "priority_flag": priority_booking,
             "queue_position": queue_position,
             "patients_ahead": patients_ahead,
             "avg_consultation_time": avg_consultation_time,
@@ -376,6 +629,7 @@ def build_queue_summary(data: Dict[str, Any], persist: bool) -> Dict[str, Any]:
             "coupon_discount": summary["couponDiscount"],
             "total_amount": summary["totalAmount"],
             "created_at": datetime.now().isoformat(),
+            "priority_status": summary["priorityStatus"],
         }
         save_bookings_df(pd.concat([bookings_df, pd.DataFrame([new_row])], ignore_index=True))
 
@@ -531,17 +785,28 @@ def api_admin_appointments():
     clinic_name = str(request.args.get("clinic_name", "")).strip()
     appointment_date = str(request.args.get("appointment_date", "")).strip()
 
-    if doctor_name:
-        bookings_df = bookings_df[bookings_df["doctor_name"].astype(str).eq(doctor_name)]
-    if clinic_name:
-        bookings_df = bookings_df[bookings_df["clinic_name"].astype(str).eq(clinic_name)]
-    if appointment_date:
-        bookings_df = bookings_df[bookings_df["appointment_date"].astype(str).eq(appointment_date)]
+    bookings_df = recalculate_and_save_filtered_queues(
+        bookings_df,
+        clinic_name=clinic_name,
+        doctor_name=doctor_name,
+        appointment_date=appointment_date,
+        additional_delay_minutes=0,
+        apply_delay_below_priority_only=False,
+    )
+    save_bookings_df(bookings_df)
 
-    bookings_df = bookings_df.sort_values(by=["appointment_date", "time_slot", "queue_position"], ascending=[True, True, True])
+    filtered_df = bookings_df.copy()
+    if doctor_name:
+        filtered_df = filtered_df[filtered_df["doctor_name"].astype(str).eq(doctor_name)]
+    if clinic_name:
+        filtered_df = filtered_df[filtered_df["clinic_name"].astype(str).eq(clinic_name)]
+    if appointment_date:
+        filtered_df = filtered_df[filtered_df["appointment_date"].astype(str).eq(appointment_date)]
+
+    filtered_df = filtered_df.sort_values(by=["appointment_date", "time_slot", "queue_position"], ascending=[True, True, True])
     # Drop duplicate booking IDs to prevent repeated rows in admin view for legacy data.
-    bookings_df = bookings_df.drop_duplicates(subset=["booking_id"], keep="first")
-    appointments = [booking_row_to_summary(row) for _, row in bookings_df.iterrows()]
+    filtered_df = filtered_df.drop_duplicates(subset=["booking_id"], keep="first")
+    appointments = [booking_row_to_summary(row) for _, row in filtered_df.iterrows()]
     return jsonify({"success": True, "appointments": appointments}), 200
 
 
@@ -557,45 +822,26 @@ def api_reschedule():
         clinic_name = str(data.get("clinic_name", "")).strip()
         appointment_date = str(data.get("appointment_date", "")).strip()
 
-        bookings_df = load_bookings_df()
+        full_df = load_bookings_df()
+        filtered_df = full_df.copy()
         if doctor_name:
-            bookings_df = bookings_df[bookings_df["doctor_name"].astype(str).eq(doctor_name)]
+            filtered_df = filtered_df[filtered_df["doctor_name"].astype(str).eq(doctor_name)]
         if clinic_name:
-            bookings_df = bookings_df[bookings_df["clinic_name"].astype(str).eq(clinic_name)]
+            filtered_df = filtered_df[filtered_df["clinic_name"].astype(str).eq(clinic_name)]
         if appointment_date:
-            bookings_df = bookings_df[bookings_df["appointment_date"].astype(str).eq(appointment_date)]
+            filtered_df = filtered_df[filtered_df["appointment_date"].astype(str).eq(appointment_date)]
 
-        if bookings_df.empty:
+        if filtered_df.empty:
             return jsonify({"success": False, "message": "No upcoming appointments found to reschedule"}), 404
 
-        updated_subset = apply_dynamic_rescheduling(bookings_df.copy(), additional_delay)
-        full_df = load_bookings_df()
-
-        for _, row in updated_subset.iterrows():
-            booking_id = str(row.get("booking_id", "")).strip()
-            if not booking_id:
-                continue
-            booking_mask = full_df["booking_id"].astype(str).eq(booking_id)
-            if not booking_mask.any():
-                continue
-
-            new_waiting_time = float(row["predicted_waiting_time"])
-            full_df.loc[booking_mask, "predicted_waiting_time"] = new_waiting_time
-
-            for idx in full_df.index[booking_mask]:
-                appointment_date_raw = str(full_df.at[idx, "appointment_date"]).strip()
-                time_slot_raw = str(full_df.at[idx, "time_slot"]).strip()
-                appointment_date_value = parse_appointment_date(appointment_date_raw)
-                time_value = parse_time_slot(time_slot_raw)
-                appointment_timestamp = appointment_date_value.replace(
-                    hour=time_value.hour,
-                    minute=time_value.minute,
-                    second=0,
-                    microsecond=0,
-                )
-                full_df.at[idx, "expected_consultation_time"] = format_clock(
-                    appointment_timestamp + timedelta(minutes=new_waiting_time)
-                )
+        full_df = recalculate_and_save_filtered_queues(
+            full_df,
+            clinic_name=clinic_name,
+            doctor_name=doctor_name,
+            appointment_date=appointment_date,
+            additional_delay_minutes=additional_delay,
+            apply_delay_below_priority_only=True,
+        )
 
         save_bookings_df(full_df)
         return jsonify(
@@ -607,6 +853,131 @@ def api_reschedule():
         ), 200
     except Exception as exc:
         return jsonify({"success": False, "message": f"Rescheduling failed: {exc}"}), 500
+
+
+@app.route("/api/cancel-booking", methods=["POST", "OPTIONS"])
+def api_cancel_booking():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    try:
+        data = request.get_json(silent=True) or {}
+        booking_id = str(data.get("booking_id", "")).strip()
+        cancel_reason = str(data.get("cancel_reason", "")).strip()
+        cancel_comments = str(data.get("cancel_comments", "")).strip()
+
+        if not booking_id:
+            return jsonify({"success": False, "message": "Booking ID is required"}), 400
+
+        # Load all bookings
+        bookings_df = load_bookings_df()
+
+        # Find the booking to cancel
+        booking_to_cancel = bookings_df[bookings_df["booking_id"].astype(str) == booking_id]
+
+        if booking_to_cancel.empty:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+
+        booking_record = booking_to_cancel.iloc[0]
+
+        # Check if appointment is in the future (cannot cancel past appointments)
+        appointment_date_str = str(booking_record["appointment_date"])
+        try:
+            appointment_date = parse_appointment_date(appointment_date_str)
+            appointment_time = parse_time_slot(str(booking_record["time_slot"]))
+            appointment_datetime = appointment_date.replace(
+                hour=appointment_time.hour, minute=appointment_time.minute
+            )
+            if datetime.now() > appointment_datetime:
+                return jsonify({"success": False, "message": "Cannot cancel past appointments"}), 400
+        except Exception:
+            pass  # Continue anyway
+
+        # Save cancellation record
+        ensure_cancelled_bookings_file()
+        cancellation_record = {
+            "booking_id": str(booking_record["booking_id"]),
+            "patient_name": str(booking_record["patient_name"]),
+            "phone_number": str(booking_record["phone_number"]),
+            "email": str(booking_record["email"]),
+            "medical_problem": str(booking_record["medical_problem"]),
+            "clinic_name": str(booking_record["clinic_name"]),
+            "doctor_name": str(booking_record["doctor_name"]),
+            "queue_position": int(float(booking_record["queue_position"] or 0)),
+            "time_slot": str(booking_record["time_slot"]),
+            "appointment_date": str(booking_record["appointment_date"]),
+            "priority_booking": int(float(booking_record["priority_booking"] or 0)),
+            "cancel_reason": cancel_reason,
+            "cancel_comments": cancel_comments,
+            "cancel_time": datetime.now().isoformat(),
+            "cancellation_reason_code": map_cancel_reason_to_code(cancel_reason),
+        }
+
+        cancelled_df = pd.read_csv(CANCELLED_BOOKINGS_FILE) if CANCELLED_BOOKINGS_FILE.exists() else pd.DataFrame(
+            columns=CANCELLED_BOOKING_COLUMNS
+        )
+        cancelled_df = pd.concat([cancelled_df, pd.DataFrame([cancellation_record])], ignore_index=True)
+        cancelled_df.to_csv(CANCELLED_BOOKINGS_FILE, index=False)
+
+        # Remove booking from active bookings
+        bookings_df = bookings_df[bookings_df["booking_id"].astype(str) != booking_id]
+
+        # Recalculate queue for the same time slot
+        clinic_name = str(booking_record["clinic_name"])
+        doctor_name = str(booking_record["doctor_name"])
+        appointment_date_val = str(booking_record["appointment_date"])
+        time_slot = str(booking_record["time_slot"])
+
+        # Get all bookings for this time slot
+        same_slot = bookings_df[
+            (bookings_df["clinic_name"].astype(str) == clinic_name)
+            & (bookings_df["doctor_name"].astype(str) == doctor_name)
+            & (bookings_df["appointment_date"].astype(str) == appointment_date_val)
+            & (bookings_df["time_slot"].astype(str) == time_slot)
+        ]
+
+        # Recalculate positions
+        if not same_slot.empty:
+            bookings_df = recalculate_and_save_filtered_queues(
+                bookings_df,
+                clinic_name=clinic_name,
+                doctor_name=doctor_name,
+                appointment_date=appointment_date_val,
+                additional_delay_minutes=0,
+                apply_delay_below_priority_only=False,
+            )
+
+        # Save updated bookings
+        save_bookings_df(bookings_df)
+
+        return jsonify(
+            {
+                "success": True,
+                "message": "Booking cancelled successfully",
+                "booking_id": booking_id,
+                "cancel_reason": cancel_reason,
+            }
+        ), 200
+
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"success": False, "message": f"Cancellation failed: {exc}"}), 500
+
+
+def map_cancel_reason_to_code(reason: str) -> str:
+    """Map cancel reason to a code for ML dataset tracking."""
+    reason_map = {
+        "Change of plan": "COP",
+        "Booked wrong slot": "BWS",
+        "Emergency situation": "ES",
+        "Doctor unavailable": "DUA",
+        "Long waiting time": "LWT",
+        "Payment issue": "PI",
+        "Other": "OTH",
+    }
+    return reason_map.get(reason, "OTH")
 
 
 @app.route("/api/ml-status", methods=["GET"])
@@ -691,7 +1062,10 @@ def mobile_predict_waiting_time():
         delay_minutes = int(data.get("delay_minutes", 0) or 0)
         queue_position = int(data.get("queue_position", patients_ahead + 1) or (patients_ahead + 1))
 
-        predicted_waiting_time = max((patients_ahead * avg_consult_time) + delay_minutes, 0)
+        predicted_waiting_time = normalize_wait_minutes(
+            patients_ahead,
+            (patients_ahead * avg_consult_time) + delay_minutes,
+        )
         expected_consultation_time = format_clock(datetime.now() + timedelta(minutes=predicted_waiting_time))
 
         return (
@@ -821,10 +1195,12 @@ def mobile_chatbot():
 ensure_ml_assets()
 ensure_users_file()
 ensure_bookings_file()
+ensure_cancelled_bookings_file()
 
 
 if __name__ == "__main__":
     ensure_ml_assets()
     ensure_users_file()
     ensure_bookings_file()
+    ensure_cancelled_bookings_file()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)

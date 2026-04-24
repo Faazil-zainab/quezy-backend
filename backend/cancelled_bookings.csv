@@ -1,0 +1,1 @@
+booking_id,patient_name,phone_number,email,medical_problem,clinic_name,doctor_name,queue_position,time_slot,appointment_date,priority_booking,cancel_reason,cancel_comments,cancel_time,cancellation_reason_code

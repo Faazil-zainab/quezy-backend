@@ -394,7 +394,7 @@ const HOME_BODY_HTML = `
                         <div class="col-12">
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch" id="priorityBooking" checked>
-                                <label class="form-check-label" for="priorityBooking">Priority Booking (discount INR 500)</label>
+                                <label class="form-check-label" for="priorityBooking">Priority Booking (+ INR 500)</label>
                             </div>
                         </div>
                         <div class="col-12">
@@ -443,7 +443,7 @@ const HOME_BODY_HTML = `
                                                 <div><small class="text-muted">Estimated time your consultation begins</small></div>
                                             </div>
                                             <div class="col-12 col-md-6"><strong>Total Amount:</strong> INR <span id="confirmAmount"></span></div>
-                                            <div class="col-12 col-md-6"><strong>Priority Discount:</strong> INR <span id="confirmPriorityDiscount"></span></div>
+                                            <div class="col-12 col-md-6"><strong>Priority Charge:</strong> INR <span id="confirmPriorityDiscount"></span></div>
                                             <div class="col-12"><strong>Payment Method:</strong> <span id="confirmPaymentMethod"></span></div>
                                             <div class="col-12"><strong>Coupon:</strong> <span id="confirmCoupon"></span></div>
                                         </div>
@@ -453,6 +453,7 @@ const HOME_BODY_HTML = `
                                 <div class="text-center mt-4 d-flex flex-wrap justify-content-center gap-2">
                                     <button id="downloadPdfBtn" type="button" class="btn btn-primary rounded-pill px-4">Download PDF</button>
                                     <button id="printConfirmationBtn" type="button" class="btn btn-outline-primary rounded-pill px-4">Print</button>
+                                    <button id="cancelBookingConfirmBtn" type="button" class="btn btn-danger rounded-pill px-4" style="display: none;">Cancel Booking</button>
                                     <button id="bookAnotherBtn" type="button" class="btn btn-outline-primary rounded-pill px-4">Book Another Appointment</button>
                                 </div>
                             </div>
@@ -499,16 +500,18 @@ const HOME_BODY_HTML = `
                                         <thead>
                                             <tr>
                                                 <th>Booking ID</th>
-                                                <th>Patient</th>
-                                                <th>Time</th>
-                                                <th>Queue</th>
+                                                <th>Patient Name</th>
+                                                <th>Doctor Name</th>
+                                                <th>Appointment Time</th>
+                                                <th>Queue Position</th>
+                                                <th>Patients Ahead</th>
                                                 <th>Predicted Wait</th>
-                                                <th>Expected Consultation</th>
+                                                <th>Priority Status</th>
                                             </tr>
                                         </thead>
                                         <tbody id="adminAppointmentsTableBody">
                                             <tr>
-                                                <td colspan="6" class="text-muted text-center py-3">No appointments loaded yet.</td>
+                                                <td colspan="7" class="text-muted text-center py-3">No appointments loaded yet.</td>
                                             </tr>
                                         </tbody>
                                     </table>
@@ -625,6 +628,44 @@ const HOME_BODY_HTML = `
             <div class="modal-footer border-top-0">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" id="confirmQrPaymentBtn" class="btn btn-primary">I Have Completed Payment</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Cancel Booking Modal -->
+<div class="modal fade" id="cancelBookingConfirmModal" tabindex="-1" aria-labelledby="cancelBookingModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header border-0">
+                <h5 class="modal-title" id="cancelBookingModalLabel">Cancel Booking</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-muted mb-3">Please select a reason for cancellation:</p>
+                <div class="mb-3">
+                    <select id="homePageCancelReasonSelect" class="form-select" required>
+                        <option value="">-- Select a reason --</option>
+                        <option value="Change of plan">Change of plan</option>
+                        <option value="Booked wrong slot">Booked wrong slot</option>
+                        <option value="Emergency situation">Emergency situation</option>
+                        <option value="Doctor unavailable">Doctor unavailable</option>
+                        <option value="Long waiting time">Long waiting time</option>
+                        <option value="Payment issue">Payment issue</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Additional Comments (Optional)</label>
+                    <textarea id="homePageCancelComments" class="form-control" rows="3" placeholder="Add any additional details..."></textarea>
+                </div>
+                <p class="alert alert-warning mb-0 small">
+                    ⚠️ Once cancelled, your slot will be reassigned to other patients. You can rebook anytime.
+                </p>
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Keep Booking</button>
+                <button type="button" class="btn btn-danger" id="confirmHomeCancelBtn" onclick="confirmCancelBookingFromConfirmation()">Yes, Cancel Booking</button>
             </div>
         </div>
     </div>

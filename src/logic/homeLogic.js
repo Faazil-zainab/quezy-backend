@@ -81,6 +81,10 @@ const confirmCoupon = document.getElementById("confirmCoupon");
 
 const downloadPdfBtn = document.getElementById("downloadPdfBtn");
 const printConfirmationBtn = document.getElementById("printConfirmationBtn");
+const cancelBookingConfirmBtn = document.getElementById("cancelBookingConfirmBtn");
+const cancelBookingConfirmModal = document.getElementById("cancelBookingConfirmModal");
+const homePageCancelReasonSelect = document.getElementById("homePageCancelReasonSelect");
+const homePageCancelComments = document.getElementById("homePageCancelComments");
 
 const loginModalElement = document.getElementById("loginModal");
 const registerModalElement = document.getElementById("registerModal");
@@ -102,7 +106,7 @@ const logoutBtn = document.getElementById("logoutBtn");
 const API_BASE_URL = "http://127.0.0.1:5000";
 
 const SERVICE_BASE_PRICES = {
-    clinic: 1200,
+    clinic: 700,
     restaurant: 900,
     salon: 800,
     medicine: 500
@@ -114,7 +118,8 @@ const SALON_SERVICE_ADDONS = {
     "Hair Spa": 300
 };
 
-const PRIORITY_DISCOUNT_VALUE = 500;
+const PRIORITY_CHARGE_VALUE = 500;
+const MIN_WAIT_MINUTES = 15;
 const STORAGE_KEY = "quezy_latest_booking";
 const WAIT_PREDICTION_STORAGE_KEY = "quezy_wait_prediction";
 const GPAY_PENDING_BOOKING_KEY = "quezy_pending_gpay_booking";
@@ -152,6 +157,64 @@ function isValidEmail(email) {
 
 function isValidPhone(phone) {
     return /^\d{10}$/.test(phone);
+}
+
+function formatDateAsInputValue(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+}
+
+function getBookingDateWindow() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+
+    return {
+        min: formatDateAsInputValue(today),
+        max: formatDateAsInputValue(tomorrow)
+    };
+}
+
+function isDateWithinBookingWindow(dateValue) {
+    if (!dateValue) {
+        return false;
+    }
+
+    const { min, max } = getBookingDateWindow();
+    return dateValue >= min && dateValue <= max;
+}
+
+function applyBookingDateRestriction(input) {
+    if (!input) {
+        return;
+    }
+
+    const { min, max } = getBookingDateWindow();
+    input.min = min;
+    input.max = max;
+
+    if (input.value && !isDateWithinBookingWindow(input.value)) {
+        input.value = min;
+    }
+
+    input.addEventListener("change", () => {
+        if (!input.value) {
+            return;
+        }
+        if (!isDateWithinBookingWindow(input.value)) {
+            input.value = min;
+        }
+    });
+}
+
+function initializeBookingDateRestrictions() {
+    [clinicDateInput, restaurantDateInput, salonDateInput, medicineDateInput].forEach((input) => {
+        applyBookingDateRestriction(input);
+    });
 }
 
 function getParsedStorage(key, fallback) {
@@ -626,19 +689,25 @@ function renderAdminAppointmentsTable(appointments) {
     adminAppointmentsTableBody.innerHTML = "";
 
     if (!appointments || appointments.length === 0) {
-        adminAppointmentsTableBody.innerHTML = '<tr><td colspan="6" class="text-muted text-center py-3">No appointments found for this doctor and date.</td></tr>';
+        adminAppointmentsTableBody.innerHTML = '<tr><td colspan="8" class="text-muted text-center py-3">No appointments found for this doctor and date.</td></tr>';
         return;
     }
 
     adminAppointmentsTableBody.innerHTML = appointments
         .map((appointment) => `
-            <tr>
+            <tr class="${appointment.priorityBooking ? "admin-priority-row" : ""}">
                 <td>${appointment.bookingId}</td>
                 <td>${appointment.name}</td>
-                <td>${appointment.timeSlot}</td>
+                <td>${appointment.doctor || "--"}</td>
+                <td>${appointment.timeSlot || "--"}</td>
                 <td>${appointment.queuePosition}</td>
+                <td>${appointment.patientsAhead ?? "--"}</td>
                 <td>${appointment.predictedWait} min</td>
-                <td>${appointment.expectedConsultation}</td>
+                <td>
+                    ${appointment.priorityBooking
+                        ? '<span class="badge rounded-pill text-dark admin-priority-badge">PRIORITY</span>'
+                        : '<span class="badge rounded-pill bg-secondary-subtle text-secondary-emphasis">Normal</span>'}
+                </td>
             </tr>
         `)
         .join("");
@@ -852,8 +921,10 @@ function buildWaitPredictionPayload() {
 }
 
 function updateWaitPredictionOutput(waitMinutes, expectedTimeText) {
+    const normalizedWaitMinutes = Math.max(Number(waitMinutes) || 0, 0);
+
     if (predictedWaitingTimeOutput) {
-        predictedWaitingTimeOutput.textContent = String(waitMinutes);
+        predictedWaitingTimeOutput.textContent = String(normalizedWaitMinutes);
     }
     if (expectedConsultationTimeOutput) {
         expectedConsultationTimeOutput.textContent = expectedTimeText;
@@ -900,6 +971,9 @@ async function requestLiveWaitPrediction() {
         if (!response.ok || !data.success || !data.prediction) {
             const message = (data && data.message) || "Unable to predict waiting time right now.";
             setWaitPredictionMessage(message, "error");
+            if (String(message).toLowerCase().includes("slots are already booked on this time no more booking")) {
+                setBookingAvailabilityState(false);
+            }
             return;
         }
 
@@ -923,6 +997,7 @@ async function requestLiveWaitPrediction() {
             summaryEl.classList.remove("d-none");
         }
 
+        setBookingAvailabilityState(true);
         setWaitPredictionMessage("Live estimate based on current bookings.", "success");
     } catch (error) {
         setWaitPredictionMessage("Prediction service unavailable. Ensure backend is running.", "error");
@@ -1410,9 +1485,9 @@ function populateHalfHourSlots(selectElement, startHour = 8, endHour = 21) {
 }
 
 function initializeServiceTimeSlots() {
-    [clinicTimeInput, restaurantTimeInput, salonTimeInput].forEach((timeSelect) => {
-        populateHalfHourSlots(timeSelect, 8, 21);
-    });
+    populateHalfHourSlots(clinicTimeInput, 10, 22);
+    populateHalfHourSlots(restaurantTimeInput, 8, 21);
+    populateHalfHourSlots(salonTimeInput, 8, 21);
 }
 
 function resetServicePanels() {
@@ -1853,6 +1928,7 @@ function validateBookingInputs(serviceType) {
         if (!nearbyClinicSelect || !nearbyClinicSelect.value) return "Select a nearby clinic.";
         if (!serviceProviderClinic || !serviceProviderClinic.value) return "Select a service provider.";
         if (!clinicDateInput || !clinicDateInput.value) return "Select an appointment date.";
+        if (!isDateWithinBookingWindow(clinicDateInput.value)) return "Only today or tomorrow is allowed for appointment date.";
         if (!clinicTimeInput || !clinicTimeInput.value) return "Select an appointment time slot.";
         return null;
     }
@@ -1860,6 +1936,7 @@ function validateBookingInputs(serviceType) {
     if (serviceType === "restaurant") {
         if (!restaurantProviderInput || !restaurantProviderInput.value) return "Select a restaurant.";
         if (!restaurantDateInput || !restaurantDateInput.value) return "Select reservation date.";
+        if (!isDateWithinBookingWindow(restaurantDateInput.value)) return "Only today or tomorrow is allowed for reservation date.";
         if (!restaurantTimeInput || !restaurantTimeInput.value) return "Select reservation slot.";
         const people = Number((restaurantPeopleInput && restaurantPeopleInput.value) || 0);
         if (!Number.isFinite(people) || people < 1) return "Number of people must be at least 1.";
@@ -1870,6 +1947,7 @@ function validateBookingInputs(serviceType) {
         if (!salonProviderInput || !salonProviderInput.value) return "Select a salon.";
         if (!salonServiceInput || !salonServiceInput.value) return "Select a salon service.";
         if (!salonDateInput || !salonDateInput.value) return "Select service date.";
+        if (!isDateWithinBookingWindow(salonDateInput.value)) return "Only today or tomorrow is allowed for service date.";
         if (!salonTimeInput || !salonTimeInput.value) return "Select service time slot.";
         return null;
     }
@@ -1877,6 +1955,7 @@ function validateBookingInputs(serviceType) {
     if (serviceType === "medicine") {
         if (!medicineRequestInput || !medicineRequestInput.value.trim()) return "Enter medicine request details.";
         if (!medicineDateInput || !medicineDateInput.value) return "Select delivery date.";
+        if (!isDateWithinBookingWindow(medicineDateInput.value)) return "Only today or tomorrow is allowed for delivery date.";
         if (!medicineTimeInput || !medicineTimeInput.value) return "Select delivery slot.";
         return null;
     }
@@ -2060,8 +2139,8 @@ function calculatePricing() {
     const couponResult = getCouponEvaluation(appliedCouponCode, baseAmount, serviceType);
     const couponDiscount = couponResult.isValid ? couponResult.discount : 0;
 
-    const priorityDiscount = priorityBookingInput && priorityBookingInput.checked ? PRIORITY_DISCOUNT_VALUE : 0;
-    const totalAmount = Math.max(baseAmount - couponDiscount - priorityDiscount, 0);
+    const priorityDiscount = priorityBookingInput && priorityBookingInput.checked ? PRIORITY_CHARGE_VALUE : 0;
+    const totalAmount = Math.max(baseAmount - couponDiscount + priorityDiscount, 0);
 
     return {
         baseAmount,
@@ -2082,7 +2161,7 @@ function updatePricePreview() {
     }
 
     if (priceBreakdown) {
-        priceBreakdown.textContent = `Base: INR ${pricing.baseAmount} | Coupon: INR ${pricing.couponDiscount} | Priority Discount: INR ${pricing.priorityDiscount}`;
+        priceBreakdown.textContent = `Base: INR ${pricing.baseAmount} | Coupon: INR ${pricing.couponDiscount} | Priority Charge: INR ${pricing.priorityDiscount}`;
     }
 
     if (appliedCouponCode) {
@@ -2215,6 +2294,18 @@ function setBookingSubmitState(isSubmitting) {
     }
 }
 
+function setBookingAvailabilityState(isAvailable) {
+    if (!confirmBookingBtn) {
+        return;
+    }
+
+    if (bookingForm && bookingForm.dataset.submitting === "true") {
+        return;
+    }
+
+    confirmBookingBtn.disabled = !isAvailable;
+}
+
 function isBookingSubmitLocked() {
     return bookingForm ? bookingForm.dataset.submitting === "true" : false;
 }
@@ -2283,7 +2374,7 @@ function renderBookingConfirmation(details, options = { persist: true, startPoll
     if (confirmPatientsAhead) confirmPatientsAhead.textContent = details.patientsAhead ?? "--";
     if (confirmAmount) confirmAmount.textContent = details.totalAmount;
     if (confirmPriorityDiscount) confirmPriorityDiscount.textContent = details.priorityDiscount;
-    if (confirmPredictedWait) confirmPredictedWait.textContent = details.predictedWait || "--";
+    if (confirmPredictedWait) confirmPredictedWait.textContent = details.predictedWait ?? "--";
     if (confirmExpectedConsultation) confirmExpectedConsultation.textContent = details.expectedConsultation || "--";
 
     // Plain-language summary alert
@@ -2292,7 +2383,7 @@ function renderBookingConfirmation(details, options = { persist: true, startPoll
     if (summaryAlert && summaryText) {
         const qPos = details.queuePosition ?? null;
         const pAhead = details.patientsAhead ?? null;
-        const pWait = details.predictedWait || null;
+        const pWait = details.predictedWait ?? null;
         const expTime = details.expectedConsultation || null;
         if (qPos !== null && pWait !== null) {
             const aheadText = Number(pAhead) === 0
@@ -2309,6 +2400,11 @@ function renderBookingConfirmation(details, options = { persist: true, startPoll
     }
     if (confirmPaymentMethod) confirmPaymentMethod.textContent = details.paymentMethod;
     if (confirmCoupon) confirmCoupon.textContent = `${details.couponCode} (INR ${details.couponDiscount})`;
+
+    // Show cancel button
+    if (cancelBookingConfirmBtn) {
+        cancelBookingConfirmBtn.style.display = "inline-block";
+    }
 
     renderQr(details);
 
@@ -2398,12 +2494,16 @@ if (bookingForm) {
                 const data = await response.json();
                 if (!response.ok || !data.success || !data.booking) {
                     setWaitPredictionMessage((data && data.message) || "Unable to book appointment.", "error");
+                    if (String((data && data.message) || "").toLowerCase().includes("slots are already booked on this time no more booking")) {
+                        setBookingAvailabilityState(false);
+                    }
                     setBookingSubmitState(false);
                     return;
                 }
 
                 renderBookingConfirmation(data.booking);
-                updateWaitPredictionOutput(data.booking.predictedWait || "--", data.booking.expectedConsultation || "--");
+                updateWaitPredictionOutput(data.booking.predictedWait ?? 0, data.booking.expectedConsultation || "--");
+                setBookingAvailabilityState(true);
                 setWaitPredictionMessage(
                     `Booked. Queue position ${data.booking.queuePosition}, patients ahead ${data.booking.patientsAhead}.`,
                     "success"
@@ -2454,6 +2554,17 @@ if (bookAnotherBtn) {
         } catch (error) {
             console.error("Local storage clear failed", error);
         }
+    });
+}
+
+if (cancelBookingConfirmBtn) {
+    cancelBookingConfirmBtn.addEventListener("click", () => {
+        if (!homePageCancelReasonSelect) return;
+        homePageCancelReasonSelect.value = "";
+        homePageCancelComments.value = "";
+        
+        const modal = new bootstrap.Modal(cancelBookingConfirmModal);
+        modal.show();
     });
 }
 
@@ -2615,6 +2726,7 @@ if ("IntersectionObserver" in window && revealNodes.length > 0) {
 }
 
 initializeServiceTimeSlots();
+initializeBookingDateRestrictions();
 initializeNearbyClinics();
 populateAdminClinicOptions();
 if (adminAppointmentDateInput) {
@@ -2629,3 +2741,75 @@ openLoginModalIfRequested();
 restoreBookingFromStorage();
 
 }
+
+// Global function for cancelling booking from confirmation page
+window.confirmCancelBookingFromConfirmation = async function confirmCancelBookingFromConfirmation() {
+    const homePageCancelReasonSelect = document.getElementById("homePageCancelReasonSelect");
+    const homePageCancelComments = document.getElementById("homePageCancelComments");
+    const displayBookingId = document.getElementById("displayBookingId");
+
+    const reason = homePageCancelReasonSelect ? homePageCancelReasonSelect.value : "";
+    const comments = homePageCancelComments ? homePageCancelComments.value : "";
+    const bookingId = displayBookingId ? displayBookingId.textContent : "";
+
+    if (!reason) {
+        alert("Please select a cancellation reason");
+        return;
+    }
+
+    if (!bookingId) {
+        alert("Error: Booking ID not found");
+        return;
+    }
+
+    try {
+        const response = await fetch("http://127.0.0.1:5000/api/cancel-booking", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                booking_id: bookingId,
+                cancel_reason: reason,
+                cancel_comments: comments
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Update local storage
+            const BOOKING_HISTORY_KEY = "quezy_booking_history";
+            const history = JSON.parse(localStorage.getItem(BOOKING_HISTORY_KEY) || "[]");
+            const updatedHistory = history.map(item => {
+                if (item.bookingId === bookingId) {
+                    return { ...item, status: "Cancelled" };
+                }
+                return item;
+            });
+            localStorage.setItem(BOOKING_HISTORY_KEY, JSON.stringify(updatedHistory));
+
+            // Close modal
+            const modalElement = document.getElementById("cancelBookingConfirmModal");
+            if (modalElement) {
+                const modal = bootstrap.Modal.getInstance(modalElement);
+                if (modal) modal.hide();
+            }
+
+            alert("Booking cancelled successfully! Your slot has been reassigned.");
+            
+            // Hide cancel button and show confirmation again
+            const cancelBtn = document.getElementById("cancelBookingConfirmBtn");
+            if (cancelBtn) {
+                cancelBtn.style.display = "none";
+            }
+            
+            location.reload();
+        } else {
+            alert("Error cancelling booking: " + (result.message || "Unknown error"));
+        }
+    } catch (error) {
+        console.error("Cancel booking error:", error);
+        alert("Failed to cancel booking. Please try again.");
+    }
+};

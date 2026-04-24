@@ -298,6 +298,15 @@ h6,
     white-space: nowrap;
 }
 
+.admin-appointments-wrap .admin-priority-row {
+    background: #fff9db;
+}
+
+.admin-appointments-wrap .admin-priority-badge {
+    background: #ffe58f;
+    border: 1px solid #f0c419;
+}
+
 #waitPredictionSpinner {
     flex: 0 0 auto;
 }
