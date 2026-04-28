@@ -23,7 +23,8 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("QUEZY_DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-USERS_FILE = DATA_DIR / "users.xlsx"
+USERS_FILE = DATA_DIR / "users.csv"
+LEGACY_USERS_FILE = DATA_DIR / "users.xlsx"
 BOOKINGS_FILE = DATA_DIR / "appointments_bookings.csv"
 CANCELLED_BOOKINGS_FILE = DATA_DIR / "cancelled_bookings.csv"
 EXPECTED_COLUMNS = ["FullName", "Email", "Phone", "Password"]
@@ -145,8 +146,22 @@ def ensure_ml_assets() -> None:
 
 
 def ensure_users_file() -> None:
-    if not USERS_FILE.exists():
-        pd.DataFrame(columns=EXPECTED_COLUMNS).to_excel(USERS_FILE, index=False)
+    if USERS_FILE.exists():
+        return
+
+    if LEGACY_USERS_FILE.exists():
+        try:
+            legacy_df = pd.read_excel(LEGACY_USERS_FILE)
+        except Exception:
+            legacy_df = pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+        for column in EXPECTED_COLUMNS:
+            if column not in legacy_df.columns:
+                legacy_df[column] = ""
+        legacy_df[EXPECTED_COLUMNS].fillna("").to_csv(USERS_FILE, index=False)
+        return
+
+    pd.DataFrame(columns=EXPECTED_COLUMNS).to_csv(USERS_FILE, index=False)
 
 
 def ensure_bookings_file() -> None:
@@ -162,7 +177,7 @@ def ensure_cancelled_bookings_file() -> None:
 def load_users_df() -> pd.DataFrame:
     ensure_users_file()
     try:
-        df = pd.read_excel(USERS_FILE)
+        df = pd.read_csv(USERS_FILE)
     except Exception:
         df = pd.DataFrame(columns=EXPECTED_COLUMNS)
 
@@ -186,7 +201,7 @@ def load_bookings_df() -> pd.DataFrame:
 
 
 def save_users_df(df: pd.DataFrame) -> None:
-    df.to_excel(USERS_FILE, index=False)
+    df.to_csv(USERS_FILE, index=False)
 
 
 def save_bookings_df(df: pd.DataFrame) -> None:
