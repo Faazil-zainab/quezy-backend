@@ -103,7 +103,7 @@ const profilePhone = document.getElementById("profilePhone");
 const bookingCountElement = document.getElementById("bookingCount");
 const logoutBtn = document.getElementById("logoutBtn");
 
-const API_BASE_URL = "http://127.0.0.1:5000";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "https://quezy-backend.onrender.com").replace(/\/$/, "");
 
 const SERVICE_BASE_PRICES = {
     clinic: 700,
