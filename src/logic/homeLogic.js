@@ -1828,7 +1828,7 @@ if (registerFormModal) {
             setFormMessage(registerFormMessage, data.message || "Account created successfully", false);
 
             setTimeout(() => {
-                window.location.href = "/login.html";
+                window.location.href = "/";
             }, 600);
         } catch (error) {
             setFormMessage(registerFormMessage, "Unable to connect to server", true);
@@ -1882,7 +1882,7 @@ if (loginFormModal) {
             setFormMessage(loginFormMessage, data.message || "Login successful", false);
 
             setTimeout(() => {
-                window.location.href = "/booking.html";
+                window.location.href = "/";
             }, 400);
         } catch (error) {
             setFormMessage(loginFormMessage, "Unable to connect to server", true);
