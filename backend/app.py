@@ -24,7 +24,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("QUEZY_DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 USERS_FILE = DATA_DIR / "users.csv"
-LEGACY_USERS_FILE = DATA_DIR / "users.xlsx"
+LEGACY_USERS_FILE = DATA_DIR / "user.csv"
+LEGACY_USERS_XLSX_FILE = DATA_DIR / "users.xlsx"
 BOOKINGS_FILE = DATA_DIR / "appointments_bookings.csv"
 CANCELLED_BOOKINGS_FILE = DATA_DIR / "cancelled_bookings.csv"
 EXPECTED_COLUMNS = ["FullName", "Email", "Phone", "Password"]
@@ -151,7 +152,19 @@ def ensure_users_file() -> None:
 
     if LEGACY_USERS_FILE.exists():
         try:
-            legacy_df = pd.read_excel(LEGACY_USERS_FILE)
+            legacy_df = pd.read_csv(LEGACY_USERS_FILE)
+        except Exception:
+            legacy_df = pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+        for column in EXPECTED_COLUMNS:
+            if column not in legacy_df.columns:
+                legacy_df[column] = ""
+        legacy_df[EXPECTED_COLUMNS].fillna("").to_csv(USERS_FILE, index=False)
+        return
+
+    if LEGACY_USERS_XLSX_FILE.exists():
+        try:
+            legacy_df = pd.read_excel(LEGACY_USERS_XLSX_FILE)
         except Exception:
             legacy_df = pd.DataFrame(columns=EXPECTED_COLUMNS)
 

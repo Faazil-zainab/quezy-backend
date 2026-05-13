@@ -103,7 +103,7 @@ const profilePhone = document.getElementById("profilePhone");
 const bookingCountElement = document.getElementById("bookingCount");
 const logoutBtn = document.getElementById("logoutBtn");
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "https://quezy-backend.onrender.com").replace(/\/$/, "");
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
 
 const SERVICE_BASE_PRICES = {
     clinic: 700,
@@ -240,25 +240,6 @@ function setStoredJson(key, value) {
 
 function getStoredProfiles() {
     return getParsedStorage(USER_PROFILES_KEY, {});
-}
-
-function saveProfileFromRegistration(payload) {
-    if (!payload || !payload.email) {
-        return;
-    }
-
-    const key = String(payload.email).trim().toLowerCase();
-    if (!key) {
-        return;
-    }
-
-    const profiles = getStoredProfiles();
-    profiles[key] = {
-        username: payload.full_name || key.split("@")[0] || "User",
-        email: key,
-        phone: payload.phone || "Not provided"
-    };
-    setStoredJson(USER_PROFILES_KEY, profiles);
 }
 
 function getProfileByEmail(email) {
@@ -1822,8 +1803,6 @@ if (registerFormModal) {
                 setFormMessage(registerFormMessage, data.message || "Registration failed", true);
                 return;
             }
-
-            saveProfileFromRegistration(payload);
 
             setFormMessage(registerFormMessage, data.message || "Account created successfully", false);
 
